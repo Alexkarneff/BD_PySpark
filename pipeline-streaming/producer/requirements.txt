@@ -1,0 +1,4 @@
+# Same versions as Airflow 3.3.2's official constraints, so the producer runs
+# identically from your venv, the producer container and Airflow (step 4).
+confluent-kafka==2.15.1
+requests==2.34.2

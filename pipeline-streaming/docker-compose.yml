@@ -1,0 +1,288 @@
+# Step 1 — Kafka (KRaft, no ZooKeeper) + topic creation + web UI + producer
+# Step 2 — Spark 3.5 Structured Streaming reading the topic
+# Step 3 — Cassandra + Spark job writing the stream into it
+# Step 4 — Airflow 3.3 (LocalExecutor + Postgres) scheduling the producer
+#
+# Two Kafka listeners, because clients connect from two places:
+#   - inside the Docker network (Spark, Airflow, producer container) -> kafka:9092
+#   - from your Windows host (producer run from your venv)            -> localhost:9094
+#
+# All image versions are pinned on purpose: never use `latest` in this project.
+
+name: pipeline-streaming
+
+# Settings shared by every Airflow service (YAML anchor, reused with <<: *airflow-common)
+x-airflow-common: &airflow-common
+  build: ./airflow
+  image: pipeline-streaming/airflow:3.3.2
+  environment: &airflow-common-env
+    # LocalExecutor: tasks run as subprocesses of the scheduler (no Celery/Redis needed locally)
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: pipeline_streaming_dev_only_secret
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # Read by the DAG (airflow/dags/random_users_to_kafka.py)
+    KAFKA_BOOTSTRAP: kafka:9092
+    KAFKA_TOPIC: random_names
+    PRODUCER_SOURCE: ${PRODUCER_SOURCE:-api}     # set PRODUCER_SOURCE=fake if randomuser.me is blocked
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./producer:/opt/airflow/producer:ro        # same producer code as your venv
+    - airflow-logs:/opt/airflow/logs
+  user: "50000:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+
+  # ------------------------------------------------------------------ Kafka
+  kafka:
+    image: apache/kafka:4.2.2
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9094:9094"          # host access only (PLAINTEXT_HOST listener)
+    environment:
+      # Single node acting as both broker and controller (KRaft mode)
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # Listeners: where Kafka listens / what address it gives back to clients
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # Single broker => every internal topic must have replication factor 1
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Topics are created explicitly by kafka-init (no silent auto-creation from typos)
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 3
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  # One-shot container: creates the topic once Kafka is healthy, then exits
+  kafka-init:
+    image: apache/kafka:4.2.2
+    container_name: kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic random_names \
+          --partitions 3 --replication-factor 1
+        echo "Topics:"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+    restart: "no"
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8888:8080"          # 8080 is kept free for Airflow later
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  # ------------------------------------------------------------------ Cassandra
+  cassandra:
+    image: cassandra:5.0           # 5.0 branch; the Spark connector 3.5.1 supports Cassandra 5.0
+    container_name: cassandra
+    hostname: cassandra
+    ports:
+      - "9042:9042"                # CQL, if you want to query from your host
+    environment:
+      # Cassandra takes ~1/4 of RAM by default: cap it so Docker Desktop stays usable
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+      CASSANDRA_CLUSTER_NAME: pipeline-streaming
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 60s            # Cassandra is slow to boot: 1-2 minutes is normal
+
+  # One-shot container: creates keyspace + table, then exits
+  cassandra-init:
+    image: cassandra:5.0
+    container_name: cassandra-init
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./cassandra/init:/init:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cqlsh cassandra 9042 -f /init/schema.cql && \
+        echo "Schema applied:" && \
+        cqlsh cassandra 9042 -e 'DESCRIBE TABLE spark_streaming.random_names'
+    restart: "no"
+
+  # ------------------------------------------------------------------ Spark
+  # Runs in local mode (driver + executors in one container), like the original tutorial.
+  # Job selected by SPARK_JOB (default: Kafka -> Cassandra). Logs: docker compose logs -f spark
+  spark:
+    build: ./spark
+    image: pipeline-streaming/spark:3.5.9
+    container_name: spark
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      cassandra-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: random_names
+      STARTING_OFFSETS: earliest
+      CASSANDRA_HOST: cassandra
+      CASSANDRA_KEYSPACE: spark_streaming
+      CASSANDRA_TABLE: random_names
+    volumes:
+      - ./spark/jobs:/opt/spark/jobs:ro          # edit jobs on your host, no rebuild needed
+      - spark-checkpoints:/opt/spark/checkpoints # streaming progress survives restarts
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[2]
+      - --py-files
+      - /opt/spark/jobs/common.py
+      - /opt/spark/jobs/${SPARK_JOB:-stream_kafka_to_cassandra.py}
+    ports:
+      - "4040:4040"          # Spark UI (Structured Streaming tab)
+    restart: on-failure
+
+  # ------------------------------------------------------------------ Airflow
+  postgres:
+    image: postgres:16
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+  # One-shot: creates/migrates the metadata DB and the admin user (airflow / airflow), then exits
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs
+        /entrypoint airflow version
+        chown -R "50000:0" /opt/airflow/logs
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+    user: "0:0"
+    restart: "no"
+
+  # Web UI + REST API + execution API used by the tasks
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Triggers DAG runs and, with LocalExecutor, runs the tasks themselves
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Parses the files in airflow/dags (Airflow 3 runs this in its own process)
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ------------------------------------------------------------------ Producer (optional)
+  # Run the producer inside Docker instead of your venv:
+  #   docker compose --profile producer run --rm producer
+  producer:
+    build: ./producer
+    container_name: producer
+    profiles: ["producer"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      KAFKA_TOPIC: random_names
+
+volumes:
+  cassandra-data:
+  spark-checkpoints:
+  airflow-postgres:
+  airflow-logs:

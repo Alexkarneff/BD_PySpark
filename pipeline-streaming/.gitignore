@@ -1,0 +1,50 @@
+# ------------------------------------------------------------------ Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments (producer run from the host)
+.venv/
+venv/
+env/
+
+# ------------------------------------------------------------------ Environment / secrets
+# Local overrides read by docker compose (e.g. PRODUCER_SOURCE=fake).
+# Commit a .env.example instead if you need to share variable names.
+.env
+.env.*
+!.env.example
+
+# ------------------------------------------------------------------ Airflow
+# Logs live in the airflow-logs Docker volume; these only appear if Airflow runs outside Docker
+airflow/logs/
+airflow/airflow.cfg
+airflow/airflow.db
+airflow/standalone_admin_password.txt
+airflow/simple_auth_manager_passwords.json.generated
+
+# ------------------------------------------------------------------ Spark
+# Checkpoints live in the spark-checkpoints Docker volume; these only appear on local runs
+checkpoints/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# ------------------------------------------------------------------ Notebooks
+.ipynb_checkpoints/
+
+# ------------------------------------------------------------------ Archives / data dumps
+*.zip
+*.tar.gz
+data/
+
+# ------------------------------------------------------------------ Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
